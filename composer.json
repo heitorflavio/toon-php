@@ -1,0 +1,34 @@
+{
+    "name": "heitorflavio/toon-php",
+    "description": "TOON (Token-Oriented Object Notation) encoder/decoder for PHP - a compact, human-readable serialization format designed for LLM prompts",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["toon", "serialization", "llm", "json", "encoder", "decoder", "tokens", "prompt"],
+    "homepage": "https://github.com/toon-format/spec",
+    "require": {
+        "php": ">=8.2",
+        "ext-mbstring": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0 || ^12.0"
+    },
+    "bin": [
+        "bin/toon"
+    ],
+    "autoload": {
+        "psr-4": {
+            "Toon\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Toon\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

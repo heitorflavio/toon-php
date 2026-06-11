@@ -1,0 +1,415 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * toon â€” command-line interface for the TOON PHP library.
+ *
+ * Converts JSON to TOON (encode) and TOON to JSON (decode).
+ * See usage() below or run `toon --help`.
+ *
+ * Exit codes: 0 success, 1 usage error, 2 encode/decode/IO error.
+ */
+
+namespace Toon\Cli;
+
+use Toon\DecodeOptions;
+use Toon\EncodeOptions;
+use Toon\Toon;
+
+// ---------------------------------------------------------------------------
+// Help / version
+// ---------------------------------------------------------------------------
+
+function usage(): string
+{
+    return <<<'TEXT'
+toon â€” TOON (Token-Oriented Object Notation) converter
+
+Usage:
+  toon encode [file|-] [options]    Encode JSON input to TOON
+  toon decode [file|-] [options]    Decode TOON input to JSON
+
+Input is read from FILE, or from STDIN when FILE is "-" or omitted.
+
+General options:
+  -o, --output FILE        Write output to FILE (default: stdout)
+      --indent=N           Spaces per indentation level (default: 2)
+  -h, --help               Show this help text and exit
+  -V, --version            Show version information and exit
+
+Encode options:
+      --delimiter=D        comma|tab|pipe, or a literal "," or "|" (default: comma)
+      --key-folding=MODE   off|safe (default: off)
+      --flatten-depth=N    Max folded key segments with --key-folding=safe
+                           (default: unlimited)
+
+Decode options:
+      --no-strict          Disable strict-mode validation (SPEC section 14)
+      --expand-paths=MODE  off|safe (default: off)
+      --compact            Emit compact JSON (default: pretty-printed)
+
+Examples:
+  toon encode data.json -o data.toon
+  echo '{"a":1}' | toon encode
+  toon decode data.toon --compact
+TEXT;
+}
+
+function version(): string
+{
+    return sprintf('toon %s (TOON spec v%s) PHP %s', Toon::VERSION, Toon::SPEC_VERSION, PHP_VERSION);
+}
+
+// ---------------------------------------------------------------------------
+// Error helpers
+// ---------------------------------------------------------------------------
+
+/** Usage error: message + usage text on STDERR, exit 1. */
+function failUsage(string $message): never
+{
+    fwrite(STDERR, 'toon: ' . $message . "\n\n" . usage() . "\n");
+    exit(1);
+}
+
+/** Runtime (encode/decode/IO) error: message on STDERR, exit 2. */
+function fail(string $message): never
+{
+    fwrite(STDERR, 'toon: ' . $message . "\n");
+    exit(2);
+}
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * @param list<string> $args CLI arguments (without the script name).
+ * @return array{
+ *     help: bool,
+ *     version: bool,
+ *     command: ?string,
+ *     input: ?string,
+ *     output: ?string,
+ *     indent: ?int,
+ *     delimiter: ?string,
+ *     keyFolding: ?string,
+ *     flattenDepth: ?int,
+ *     strict: bool,
+ *     expandPaths: ?string,
+ *     compact: bool,
+ *     used: list<string>,
+ * }
+ */
+function parseArgs(array $args): array
+{
+    $parsed = [
+        'help' => false,
+        'version' => false,
+        'command' => null,
+        'input' => null,
+        'output' => null,
+        'indent' => null,
+        'delimiter' => null,
+        'keyFolding' => null,
+        'flattenDepth' => null,
+        'strict' => true,
+        'expandPaths' => null,
+        'compact' => false,
+        'used' => [],
+    ];
+
+    $positionals = [];
+    $optionsDone = false;
+
+    for ($i = 0, $count = count($args); $i < $count; $i++) {
+        $arg = $args[$i];
+
+        if ($optionsDone || $arg === '-' || $arg === '' || $arg[0] !== '-') {
+            $positionals[] = $arg;
+            continue;
+        }
+        if ($arg === '--') {
+            $optionsDone = true;
+            continue;
+        }
+
+        // Split "--name=value"; short options take their value from the next argument.
+        $name = $arg;
+        $inlineValue = null;
+        if (str_starts_with($arg, '--') && ($eq = strpos($arg, '=')) !== false) {
+            $name = substr($arg, 0, $eq);
+            $inlineValue = substr($arg, $eq + 1);
+        }
+
+        $takeValue = static function () use ($args, &$i, $count, $name, $inlineValue): string {
+            if ($inlineValue !== null) {
+                return $inlineValue;
+            }
+            if ($i + 1 >= $count) {
+                failUsage(sprintf('option "%s" requires a value', $name));
+            }
+
+            return $args[++$i];
+        };
+
+        if ($inlineValue !== null
+            && in_array($name, ['-h', '--help', '-V', '--version', '--no-strict', '--compact'], true)
+        ) {
+            failUsage(sprintf('option "%s" does not accept a value', $name));
+        }
+
+        switch ($name) {
+            case '-h':
+            case '--help':
+                $parsed['help'] = true;
+                break;
+            case '-V':
+            case '--version':
+                $parsed['version'] = true;
+                break;
+            case '-o':
+            case '--output':
+                $parsed['output'] = $takeValue();
+                break;
+            case '--indent':
+                $parsed['indent'] = parseIntOption($takeValue(), '--indent', min: 1);
+                break;
+            case '--delimiter':
+                $parsed['delimiter'] = parseDelimiter($takeValue());
+                break;
+            case '--key-folding':
+                $parsed['keyFolding'] = parseChoice($takeValue(), '--key-folding', ['off', 'safe']);
+                break;
+            case '--flatten-depth':
+                $parsed['flattenDepth'] = parseIntOption($takeValue(), '--flatten-depth', min: 0);
+                break;
+            case '--no-strict':
+                $parsed['strict'] = false;
+                break;
+            case '--expand-paths':
+                $parsed['expandPaths'] = parseChoice($takeValue(), '--expand-paths', ['off', 'safe']);
+                break;
+            case '--compact':
+                $parsed['compact'] = true;
+                break;
+            default:
+                failUsage(sprintf('unknown option "%s"', $arg));
+        }
+
+        $parsed['used'][] = $name;
+    }
+
+    if ($parsed['help'] || $parsed['version']) {
+        return $parsed;
+    }
+
+    if ($positionals === []) {
+        failUsage('missing subcommand (expected "encode" or "decode")');
+    }
+
+    $command = array_shift($positionals);
+    if (!in_array($command, ['encode', 'decode'], true)) {
+        failUsage(sprintf('unknown subcommand "%s" (expected "encode" or "decode")', $command));
+    }
+    $parsed['command'] = $command;
+
+    if ($positionals !== []) {
+        $parsed['input'] = array_shift($positionals);
+    }
+    if ($positionals !== []) {
+        failUsage(sprintf('unexpected extra argument "%s"', $positionals[0]));
+    }
+
+    $exclusive = [
+        '--delimiter' => 'encode',
+        '--key-folding' => 'encode',
+        '--flatten-depth' => 'encode',
+        '--no-strict' => 'decode',
+        '--expand-paths' => 'decode',
+        '--compact' => 'decode',
+    ];
+    foreach ($parsed['used'] as $name) {
+        if (isset($exclusive[$name]) && $exclusive[$name] !== $command) {
+            failUsage(sprintf('option "%s" is only valid for the "%s" subcommand', $name, $exclusive[$name]));
+        }
+    }
+
+    return $parsed;
+}
+
+function parseIntOption(string $value, string $option, int $min): int
+{
+    if (preg_match('/^[0-9]+$/', $value) !== 1 || (int) $value < $min) {
+        failUsage(sprintf('option "%s" expects an integer >= %d, got "%s"', $option, $min, $value));
+    }
+
+    return (int) $value;
+}
+
+/** @param list<string> $choices */
+function parseChoice(string $value, string $option, array $choices): string
+{
+    if (!in_array($value, $choices, true)) {
+        failUsage(sprintf('option "%s" expects one of: %s (got "%s")', $option, implode('|', $choices), $value));
+    }
+
+    return $value;
+}
+
+function parseDelimiter(string $value): string
+{
+    return match ($value) {
+        'comma', ',' => ',',
+        'tab', "\t" => "\t",
+        'pipe', '|' => '|',
+        default => failUsage(sprintf(
+            'option "--delimiter" expects comma|tab|pipe (or a literal "," or "|"), got "%s"',
+            $value,
+        )),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// IO
+// ---------------------------------------------------------------------------
+
+function readInput(?string $path): string
+{
+    if ($path === null || $path === '-') {
+        $content = stream_get_contents(STDIN);
+        if ($content === false) {
+            fail('failed to read from STDIN');
+        }
+    } else {
+        if (!file_exists($path)) {
+            fail(sprintf('no such file: %s', $path));
+        }
+        $content = @file_get_contents($path);
+        if ($content === false) {
+            fail(sprintf('failed to read "%s"', $path));
+        }
+    }
+
+    // Strip a UTF-8 BOM (common in files produced by Windows tools).
+    if (str_starts_with($content, "\u{FEFF}")) {
+        $content = substr($content, 3);
+    }
+
+    return $content;
+}
+
+function writeOutput(?string $path, string $content): void
+{
+    if ($path === null) {
+        fwrite(STDOUT, $content);
+
+        return;
+    }
+    if (@file_put_contents($path, $content) === false) {
+        fail(sprintf('failed to write "%s"', $path));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subcommands
+// ---------------------------------------------------------------------------
+
+/** @param array<string, mixed> $parsed */
+function runEncode(array $parsed): void
+{
+    $input = readInput($parsed['input']);
+
+    try {
+        // assoc=false keeps the {} vs [] distinction (empty objects decode to stdClass).
+        $value = json_decode($input, false, 512, JSON_THROW_ON_ERROR);
+    } catch (\JsonException $e) {
+        fail('invalid JSON input: ' . $e->getMessage());
+    }
+
+    try {
+        $options = new EncodeOptions(
+            indent: $parsed['indent'] ?? 2,
+            delimiter: $parsed['delimiter'] ?? ',',
+            keyFolding: $parsed['keyFolding'] ?? 'off',
+            flattenDepth: $parsed['flattenDepth'],
+        );
+        $toon = Toon::encode($value, $options);
+    } catch (\Throwable $e) {
+        fail('encode error: ' . $e->getMessage());
+    }
+
+    // The library emits no trailing newline; add exactly one for terminals.
+    writeOutput($parsed['output'], $toon . "\n");
+}
+
+/** @param array<string, mixed> $parsed */
+function runDecode(array $parsed): void
+{
+    $input = readInput($parsed['input']);
+
+    try {
+        // Default stdClass mode preserves empty objects ({} vs []).
+        $options = new DecodeOptions(
+            indent: $parsed['indent'] ?? 2,
+            strict: $parsed['strict'],
+            expandPaths: $parsed['expandPaths'] ?? 'off',
+        );
+        $value = Toon::decode($input, $options);
+    } catch (\Throwable $e) {
+        fail('decode error: ' . $e->getMessage());
+    }
+
+    $flags = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR;
+    if (!$parsed['compact']) {
+        $flags |= JSON_PRETTY_PRINT;
+    }
+
+    try {
+        $json = json_encode($value, $flags);
+    } catch (\JsonException $e) {
+        fail('failed to encode result as JSON: ' . $e->getMessage());
+    }
+
+    writeOutput($parsed['output'], $json . "\n");
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
+
+(static function (array $argv): void {
+    foreach ([
+        __DIR__ . '/../vendor/autoload.php',  // running from a git checkout
+        __DIR__ . '/../../../autoload.php',   // installed as a Composer dependency (vendor/heitorflavio/toon-php/bin)
+        __DIR__ . '/../autoload.php',         // bin/ placed next to an autoloader
+    ] as $autoloader) {
+        if (is_file($autoloader)) {
+            require $autoloader;
+            break;
+        }
+    }
+
+    if (!class_exists(Toon::class)) {
+        fail('unable to locate the Composer autoloader; run "composer install"');
+    }
+
+    $parsed = parseArgs(array_slice($argv, 1));
+
+    if ($parsed['help']) {
+        fwrite(STDOUT, usage() . "\n");
+        exit(0);
+    }
+    if ($parsed['version']) {
+        fwrite(STDOUT, version() . "\n");
+        exit(0);
+    }
+
+    match ($parsed['command']) {
+        'encode' => runEncode($parsed),
+        'decode' => runDecode($parsed),
+    };
+
+    exit(0);
+})($argv);
