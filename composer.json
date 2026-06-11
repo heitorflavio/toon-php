@@ -12,6 +12,9 @@
     "require-dev": {
         "phpunit/phpunit": "^11.0 || ^12.0"
     },
+    "suggest": {
+        "illuminate/support": "To use the Blade directives (@toon, @tooneach) in a Laravel app (^10 || ^11 || ^12)."
+    },
     "bin": [
         "bin/toon"
     ],
@@ -27,6 +30,13 @@
     },
     "scripts": {
         "test": "phpunit"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Toon\\Laravel\\ToonServiceProvider"
+            ]
+        }
     },
     "config": {
         "sort-packages": true

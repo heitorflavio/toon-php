@@ -98,6 +98,59 @@ $back = Toon::decode(Toon::encode($original), new DecodeOptions(associative: tru
 var_export($back === $original); // true
 ```
 
+## Laravel & Blade
+
+Building LLM prompts in Blade views? The package ships a ServiceProvider that is
+auto-discovered on install — no registration needed — and adds two directives.
+Their output is intentionally **not** HTML-escaped, since prompts are plain text,
+not page markup. Eloquent models and `Illuminate\Support\Collection` encode
+natively (both implement `JsonSerializable`).
+
+### `@toon` — encode a whole structure
+
+This is the directive you want most of the time. TOON iterates uniform arrays
+internally, so there's no manual loop: hand it the data and the array key names
+the table.
+
+```blade
+@toon(['orders' => $orders])
+```
+
+```
+orders[3]{sku,qty,price}:
+  A1,2,9.99
+  B2,1,14.5
+  C7,5,3.75
+```
+
+Pass a bare collection (`@toon($orders)`) to emit a root-level table without a name.
+
+### `@tooneach` — loop-style projection
+
+Reach for the block form only when you need **per-row control** — selecting a
+subset of fields, computing a derived value, or skipping items with `@if`. Each
+`@toonrow` pushes one associative row; the block collects them into a uniform
+table. The optional leading string literal names the table (recommended — it
+gives the model context and acts as a parsing guardrail).
+
+```blade
+@tooneach('orders', $orders as $o)
+    @toonrow(['sku' => $o->sku, 'qty' => $o->qty, 'total' => $o->qty * $o->price])
+@endtooneach
+```
+
+```
+orders[3]{sku,qty,total}:
+  A1,2,19.98
+  B2,1,14.5
+  C7,5,18.75
+```
+
+Whitespace between the directives is discarded — only the encoded table is
+emitted. Omit the name (`@tooneach($orders as $o)`) for a root-level table.
+Don't nest `@tooneach` blocks (they share an internal accumulator); shape nested
+data in PHP and pass it to `@toon` instead.
+
 ## API
 
 ```php
